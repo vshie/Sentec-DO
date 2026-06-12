@@ -102,10 +102,20 @@ UI label (`% air saturation`, `mg/L`, etc.).
 
 ## MAVLink2Rest
 
-Two `NAMED_VALUE_FLOAT` messages are published every poll:
+Two `NAMED_VALUE_FLOAT` messages are published every poll (5 s):
 
 - `DO`  - dissolved oxygen in the sensor's currently configured unit
 - `TDO` - sensor temperature in degrees C
+
+They are sent with `system_id` 255 and a **unique `component_id` per metric**
+(`DO` = 70, `TDO` = 71). This matters: mavlink2rest keys its store by
+system/component/message_type, so sending both names from one component makes
+them overwrite each other (only the last survives), and `component_id` 0
+(`MAV_COMP_ID_ALL`) is an invalid source the autopilot ignores. With distinct
+non-zero components both values persist in the inspector
+(`/v1/mavlink/vehicles/255/components/70|71/messages/NAMED_VALUE_FLOAT`) and are
+logged to the autopilot `.BIN`. The chosen base (70) stays clear of the BlueOS
+PH/TEMP/SAL/COND range (25-28) and the Mikrotik-Monitor range (60-66).
 
 ## Build / deploy
 
