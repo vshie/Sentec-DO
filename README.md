@@ -22,6 +22,60 @@ in the BlueOS web UI, logs to CSV, and forwards values to the autopilot's
 - Blue Robotics BLUART USB-to-RS485 adapter (FTDI FT232 based)
 - A BlueOS host (Raspberry Pi)
 
+## Installation
+
+The published Docker image is **`vshie/blueos-sentec-do`** on Docker Hub.
+
+### From the BlueOS Extension Manager (recommended)
+
+Once Blue Robotics indexes the extension, it will appear in the BlueOS
+**Extensions** tab. Click *Install* and the manager handles everything.
+
+### Manual install (until the extension is indexed)
+
+In BlueOS, open **Extensions -> Installed -> + (Add Extension)** and use:
+
+- **Extension Identifier**: `vshie.blueos-sentec-do`
+- **Extension Name**: `Sentec DO`
+- **Docker image**: `vshie/blueos-sentec-do`
+- **Docker tag**: `latest`
+- **Original Settings (Permissions)**: paste the JSON below
+
+```json
+{
+  "ExposedPorts": {
+    "6438/tcp": {}
+  },
+  "HostConfig": {
+    "CpuPeriod": 100000,
+    "CpuQuota": 100000,
+    "Binds": [
+      "/usr/blueos/extensions/sentec-do:/app/logs",
+      "/dev/ttyUSB0:/dev/ttyUSB0",
+      "/dev/ttyUSB1:/dev/ttyUSB1",
+      "/dev/ttyUSB2:/dev/ttyUSB2",
+      "/dev/ttyUSB3:/dev/ttyUSB3",
+      "/dev/ttyACM0:/dev/ttyACM0",
+      "/dev/ttyACM1:/dev/ttyACM1"
+    ],
+    "ExtraHosts": ["host.docker.internal:host-gateway"],
+    "PortBindings": {
+      "6438/tcp": [
+        {
+          "HostPort": ""
+        }
+      ]
+    },
+    "NetworkMode": "host",
+    "Privileged": true
+  }
+}
+```
+
+After install, open the extension card and click *View* to access the
+dashboard. The live DO graph for embedding (e.g. in a BlueOS cockpit) is
+served at `/widget`.
+
 ## Sensor protocol
 
 This extension uses the OXYnor Modbus RTU protocol (the alternative ASCII
