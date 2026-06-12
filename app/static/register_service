@@ -1,0 +1,9 @@
+{
+    "name": "Sentec DO",
+    "description": "Sentec OXYnor Dissolved Oxygen Monitor",
+    "icon": "mdi-chart-bubble",
+    "company": "Blue Robotics",
+    "version": "0.1.0",
+    "webpage": "/",
+    "api": ""
+}

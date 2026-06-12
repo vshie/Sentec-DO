@@ -1,0 +1,8 @@
+.venv
+*.swp
+*.egg-info
+**/build
+**/__pycache__
+logs/
+*.csv
+.DS_Store

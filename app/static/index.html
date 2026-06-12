@@ -1,0 +1,464 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Sentec DO</title>
+  <style>
+    @font-face { font-family: 'Roboto'; font-style: normal; font-weight: 100; src: url('vendor/Roboto-100.woff2') format('woff2'); }
+    @font-face { font-family: 'Roboto'; font-style: normal; font-weight: 300; src: url('vendor/Roboto-300.woff2') format('woff2'); }
+    @font-face { font-family: 'Roboto'; font-style: normal; font-weight: 400; src: url('vendor/Roboto-400.woff2') format('woff2'); }
+    @font-face { font-family: 'Roboto'; font-style: normal; font-weight: 500; src: url('vendor/Roboto-500.woff2') format('woff2'); }
+    @font-face { font-family: 'Roboto'; font-style: normal; font-weight: 700; src: url('vendor/Roboto-700.woff2') format('woff2'); }
+    @font-face { font-family: 'Roboto'; font-style: normal; font-weight: 900; src: url('vendor/Roboto-900.woff2') format('woff2'); }
+  </style>
+  <link href="vendor/materialdesignicons.min.css" rel="stylesheet">
+  <style>
+    @font-face {
+      font-family: "Material Design Icons";
+      src: url('vendor/materialdesignicons-webfont.woff2') format('woff2');
+      font-weight: normal;
+      font-style: normal;
+    }
+  </style>
+  <link href="vendor/vuetify.min.css" rel="stylesheet">
+  <script src="vendor/vue.js"></script>
+  <script src="vendor/vuetify.js"></script>
+  <script src="vendor/axios.min.js"></script>
+  <script src="vendor/chart.min.js"></script>
+  <script src="vendor/chartjs-plugin-zoom.min.js"></script>
+  <style>
+    [v-cloak] { display: none; }
+    .logo-container { display: flex; align-items: center; gap: 15px; }
+    .header-title { font-size: 1.5rem; font-weight: 500; margin: 0; }
+    .theme--dark.v-sheet { background-color: #1E1E1E; }
+    .theme--dark.v-card { background-color: #2D2D2D; }
+    .chart-container { padding: 10px; height: 400px; position: relative; }
+    .card-header { display: flex; justify-content: space-between; align-items: center; }
+    .info-chip { margin: 0 4px; }
+    .chart-controls { display: flex; gap: 8px; margin-top: 8px; }
+  </style>
+</head>
+<body>
+  <div id="app" v-cloak>
+    <v-app dark>
+      <v-app-bar app dark dense>
+        <div class="logo-container">
+          <v-icon large color="primary">mdi-chart-bubble</v-icon>
+          <h1 class="header-title">Sentec DO</h1>
+        </div>
+        <v-spacer></v-spacer>
+        <v-chip class="info-chip" small>
+          <v-icon small left>mdi-water-percent</v-icon>
+          DO unit: {{ doUnit }}
+        </v-chip>
+        <v-chip class="info-chip" small>
+          <v-icon small left>mdi-serial-port</v-icon>
+          {{ serialPortInfo }}
+        </v-chip>
+      </v-app-bar>
+
+      <v-main>
+        <v-container fluid>
+          <v-tabs v-model="activeTab" background-color="transparent" color="primary">
+            <v-tab><v-icon small left>mdi-chart-line</v-icon>Measurement</v-tab>
+            <v-tab><v-icon small left>mdi-cog</v-icon>Settings</v-tab>
+          </v-tabs>
+
+          <v-tabs-items v-model="activeTab">
+            <!-- Measurement Tab -->
+            <v-tab-item>
+              <v-card flat>
+                <v-card-text>
+                  <v-row>
+                    <v-col cols="12" md="4">
+                      <v-card elevation="2">
+                        <v-card-title>Latest reading</v-card-title>
+                        <v-card-text>
+                          <div class="text-h5 mb-2">
+                            <v-icon color="info" left>mdi-water</v-icon>
+                            DO: <strong>{{ latestDo }}</strong>
+                            <span class="text-subtitle-1">{{ doUnit }}</span>
+                          </div>
+                          <div class="text-h5 mb-2">
+                            <v-icon color="error" left>mdi-thermometer</v-icon>
+                            Temp: <strong>{{ latestTemp }}</strong> &deg;C
+                          </div>
+                          <div class="text-caption">
+                            Pressure: {{ latestPressure }} hPa | Phase: {{ latestPhase }}&deg; | Error: 0x{{ latestError }}
+                          </div>
+                          <div class="text-caption">Updated: {{ latestTimestamp }}</div>
+                        </v-card-text>
+                      </v-card>
+                    </v-col>
+                    <v-col cols="12" md="8">
+                      <v-card elevation="2">
+                        <v-card-title class="card-header">
+                          <span>Dissolved Oxygen & Temperature</span>
+                          <v-select
+                            v-model="selectedDuration"
+                            :items="durationOptions"
+                            label="Time Window"
+                            dense outlined hide-details
+                            @change="onDurationChange"
+                            style="max-width: 200px"
+                          ></v-select>
+                        </v-card-title>
+                        <v-card-text>
+                          <div class="chart-container">
+                            <canvas id="myChart" ref="chartCanvas"></canvas>
+                          </div>
+                          <div class="chart-controls">
+                            <v-btn small text @click="resetZoom">
+                              <v-icon small left>mdi-refresh</v-icon>Reset Zoom
+                            </v-btn>
+                            <v-btn small text @click="togglePan">
+                              <v-icon small left>{{ panEnabled ? 'mdi-pan-off' : 'mdi-pan' }}</v-icon>
+                              {{ panEnabled ? 'Disable Pan' : 'Enable Pan' }}
+                            </v-btn>
+                          </div>
+                        </v-card-text>
+                      </v-card>
+                    </v-col>
+                  </v-row>
+                </v-card-text>
+              </v-card>
+            </v-tab-item>
+
+            <!-- Settings Tab -->
+            <v-tab-item>
+              <v-card flat>
+                <v-card-text>
+                  <v-row>
+                    <v-col cols="12" md="6">
+                      <v-card elevation="2">
+                        <v-card-title>Data Management</v-card-title>
+                        <v-card-text>
+                          <v-btn color="primary" block class="mb-4" @click="downloadLogs">
+                            <v-icon left>mdi-download</v-icon>Download Logs
+                          </v-btn>
+                          <v-btn color="error" block @click="showDeleteDialog = true">
+                            <v-icon left>mdi-delete</v-icon>Delete Logs
+                          </v-btn>
+                        </v-card-text>
+                      </v-card>
+                    </v-col>
+
+                    <v-col cols="12" md="6">
+                      <v-card elevation="2">
+                        <v-card-title>Serial Port Settings</v-card-title>
+                        <v-card-text>
+                          <v-select
+                            v-model="selectedPort"
+                            :items="availablePorts"
+                            label="Serial Port"
+                            :loading="portsLoading"
+                            :disabled="portsLoading"
+                            item-text="name"
+                            item-value="path"
+                            outlined
+                            @change="onPortChange"
+                          >
+                            <template v-slot:append-outer>
+                              <v-btn icon small class="ml-1" @click="refreshPorts" :disabled="portsLoading">
+                                <v-icon small>mdi-refresh</v-icon>
+                              </v-btn>
+                            </template>
+                          </v-select>
+                          <div class="mt-2 caption">
+                            <v-icon small color="info">mdi-information</v-icon>
+                            19200 8N2, Modbus RTU slave ID 1 (OXYnor defaults).
+                            Changing ports will reconnect the sensor.
+                          </div>
+                        </v-card-text>
+                      </v-card>
+                    </v-col>
+
+                    <v-col cols="12" md="6">
+                      <v-card elevation="2">
+                        <v-card-title>About</v-card-title>
+                        <v-card-text>
+                          <p>Sentec DO is a BlueOS extension that reads a Sentec OXYnor
+                          dissolved-oxygen sensor over RS485 / Modbus RTU (via a BLUART
+                          adapter) and forwards readings to the autopilot's
+                          <code>.BIN</code> log as <code>DO</code> and <code>TDO</code>
+                          named-value floats.</p>
+                          <p class="mb-0"><strong>Version:</strong> 0.1.0</p>
+                        </v-card-text>
+                      </v-card>
+                    </v-col>
+                  </v-row>
+                </v-card-text>
+              </v-card>
+            </v-tab-item>
+          </v-tabs-items>
+        </v-container>
+      </v-main>
+
+      <v-dialog v-model="showDeleteDialog" max-width="400">
+        <v-card>
+          <v-card-title class="headline">Warning</v-card-title>
+          <v-card-text>Are you sure you want to delete all logs? This action cannot be undone.</v-card-text>
+          <v-card-actions>
+            <v-spacer></v-spacer>
+            <v-btn color="primary" text @click="showDeleteDialog = false">Cancel</v-btn>
+            <v-btn color="error" text @click="deleteLogsConfirmed">Delete</v-btn>
+          </v-card-actions>
+        </v-card>
+      </v-dialog>
+
+      <v-snackbar v-model="snackbar.show" :color="snackbar.color" :timeout="3000">
+        {{ snackbar.text }}
+        <template v-slot:action="{ attrs }">
+          <v-btn text v-bind="attrs" @click="snackbar.show = false">Close</v-btn>
+        </template>
+      </v-snackbar>
+    </v-app>
+  </div>
+
+  <script>
+    new Vue({
+      el: '#app',
+      vuetify: new Vuetify({
+        theme: {
+          dark: true,
+          themes: {
+            dark: {
+              primary: '#1976D2', secondary: '#424242', accent: '#82B1FF',
+              error: '#FF5252', info: '#2196F3', success: '#4CAF50', warning: '#FFC107'
+            }
+          }
+        }
+      }),
+      data: {
+        activeTab: 0,
+        serialPortInfo: '',
+        doUnit: 'DO',
+        selectedDuration: '5',
+        durationOptions: [
+          { text: 'Last Minute',     value: '1' },
+          { text: 'Last 5 Minutes',  value: '5' },
+          { text: 'Last 10 Minutes', value: '10' },
+          { text: 'Last 30 Minutes', value: '30' },
+          { text: 'All Data',        value: 'all' }
+        ],
+        chart: null,
+        measurements: [],
+        refreshTimer: null,
+        showDeleteDialog: false,
+        snackbar: { show: false, color: 'success', text: '' },
+        selectedPort: '',
+        availablePorts: [],
+        portsLoading: false,
+        panEnabled: false
+      },
+      computed: {
+        latest() {
+          return this.measurements.length ? this.measurements[this.measurements.length - 1] : null;
+        },
+        latestDo()        { return this.latest && this.latest.do != null ? this.latest.do.toFixed(2) : '--'; },
+        latestTemp()      { return this.latest && this.latest.temperature != null ? this.latest.temperature.toFixed(2) : '--'; },
+        latestPressure()  { return this.latest && this.latest.pressure != null ? this.latest.pressure.toFixed(1) : '--'; },
+        latestPhase()     { return this.latest && this.latest.phase != null ? this.latest.phase.toFixed(2) : '--'; },
+        latestError()     { return this.latest && this.latest.error != null ? this.latest.error.toString(16).toUpperCase() : '--'; },
+        latestTimestamp() {
+          if (!this.latest) return '--';
+          try { return new Date(this.latest.timestamp).toLocaleString(); }
+          catch (e) { return this.latest.timestamp; }
+        }
+      },
+      methods: {
+        handleResize() {
+          if (this.chart) {
+            try { this.chart.resize(); this.chart.update('none'); }
+            catch (e) { console.error('chart resize error', e); }
+          }
+        },
+        fetchSerialInfo() {
+          axios.get('/api/serial').then(r => {
+            const info = r.data;
+            this.serialPortInfo = `${info.serial_port} @ ${info.baud_rate} ${info.framing || ''}`.trim();
+            this.selectedPort = info.serial_port;
+            if (info.oxygen_unit) this.doUnit = info.oxygen_unit;
+          }).catch(e => console.error('fetchSerialInfo', e));
+        },
+        fetchData() {
+          const maxPoints = 500;
+          const url = this.selectedDuration === 'all'
+            ? `/api/data?max_points=${maxPoints}`
+            : `/api/data?duration=${this.selectedDuration}&max_points=${maxPoints}`;
+          axios.get(url).then(r => {
+            const newData = r.data || [];
+            if (newData.length > 0) {
+              this.measurements = newData;
+              const lastUnit = newData[newData.length - 1].do_unit;
+              if (lastUnit) this.doUnit = lastUnit;
+              this.updateChart();
+            }
+          }).catch(e => {
+            console.error('fetchData', e);
+            this.snackbar = { show: true, color: 'error', text: 'Error fetching data' };
+          });
+        },
+        updateChart() {
+          if (!Array.isArray(this.measurements)) this.measurements = [];
+          const labels = this.measurements.map(m => {
+            try { return m && m.timestamp ? new Date(m.timestamp).toLocaleTimeString() : ''; }
+            catch (e) { return ''; }
+          });
+          const temperatureData = this.measurements.map(m => m && typeof m.temperature === 'number' ? m.temperature : null);
+          const doData          = this.measurements.map(m => m && typeof m.do === 'number' ? m.do : null);
+          const vehTempData     = this.measurements.map(m => m && typeof m.vehicle_temperature === 'number' ? m.vehicle_temperature : null);
+
+          if (!this.chart) {
+            const ctx = document.getElementById('myChart');
+            if (!ctx) return;
+            const c2d = ctx.getContext('2d');
+            if (!c2d) return;
+            this.chart = new Chart(c2d, {
+              type: 'line',
+              data: {
+                labels: labels,
+                datasets: [
+                  { label: `Dissolved Oxygen (${this.doUnit})`, data: doData, borderColor: '#2196F3',
+                    backgroundColor: 'rgba(33,150,243,0.1)', borderWidth: 2, pointRadius: 0,
+                    pointHoverRadius: 4, fill: true, yAxisID: 'y-do' },
+                  { label: 'Temperature (\u00B0C)', data: temperatureData, borderColor: '#FF5252',
+                    backgroundColor: 'rgba(255,82,82,0.1)', borderWidth: 2, pointRadius: 0,
+                    pointHoverRadius: 4, fill: true, yAxisID: 'y-temp' },
+                  { label: 'Vehicle Temperature (\u00B0C)', data: vehTempData, borderColor: '#4CAF50',
+                    backgroundColor: 'rgba(76,175,80,0.1)', borderWidth: 2, pointRadius: 0,
+                    pointHoverRadius: 4, fill: true, yAxisID: 'y-temp' }
+                ]
+              },
+              options: {
+                responsive: true, maintainAspectRatio: false, animation: false,
+                elements: { line: { tension: 0 } },
+                tooltips: { mode: 'index', intersect: false, backgroundColor: 'rgba(50,50,50,0.9)',
+                            titleFontFamily: 'Roboto', bodyFontFamily: 'Roboto' },
+                hover: { mode: 'nearest', intersect: true },
+                legend: { labels: { fontFamily: 'Roboto', fontColor: '#FFFFFF' } },
+                scales: {
+                  xAxes: [{ display: true, gridLines: { color: 'rgba(255,255,255,0.1)' },
+                            scaleLabel: { display: true, labelString: 'Time', fontColor: '#FFFFFF' },
+                            ticks: { fontColor: '#FFFFFF' } }],
+                  yAxes: [
+                    { id: 'y-do', position: 'left', gridLines: { color: 'rgba(255,255,255,0.1)' },
+                      scaleLabel: { display: true, labelString: `Oxygen (${this.doUnit})`, fontColor: '#FFFFFF' },
+                      ticks: { fontColor: '#FFFFFF' } },
+                    { id: 'y-temp', position: 'right',
+                      gridLines: { drawOnChartArea: false, color: 'rgba(255,255,255,0.1)' },
+                      scaleLabel: { display: true, labelString: 'Temperature (\u00B0C)', fontColor: '#FFFFFF' },
+                      ticks: { fontColor: '#FFFFFF' } }
+                  ]
+                },
+                plugins: {
+                  zoom: {
+                    pan: { enabled: false, mode: 'x' },
+                    zoom: {
+                      enabled: true, mode: 'x',
+                      drag: { enabled: true, backgroundColor: 'rgba(33,150,243,0.1)',
+                              borderColor: '#2196F3', borderWidth: 1 }
+                    }
+                  }
+                }
+              }
+            });
+          } else {
+            try {
+              this.chart.data.labels = labels;
+              this.chart.data.datasets[0].label = `Dissolved Oxygen (${this.doUnit})`;
+              this.chart.data.datasets[0].data = doData;
+              this.chart.data.datasets[1].data = temperatureData;
+              this.chart.data.datasets[2].data = vehTempData;
+              const doAxis = this.chart.options.scales.yAxes[0];
+              if (doAxis && doAxis.scaleLabel) doAxis.scaleLabel.labelString = `Oxygen (${this.doUnit})`;
+              this.chart.update(0);
+            } catch (e) { console.error('chart update', e); }
+          }
+        },
+        onDurationChange() { this.fetchData(); },
+        startRefreshTimer() {
+          if (this.refreshTimer) clearInterval(this.refreshTimer);
+          this.refreshTimer = setInterval(() => {
+            if (!document.hidden) this.fetchData();
+          }, 5000);
+        },
+        downloadLogs() { window.location.href = '/api/logs'; },
+        deleteLogsConfirmed() { this.deleteLogs(); this.showDeleteDialog = false; },
+        deleteLogs() {
+          axios.post('/api/logs/delete').then(r => {
+            if (r.data.success) this.snackbar = { show: true, color: 'success', text: 'Logs deleted' };
+            else                this.snackbar = { show: true, color: 'error',   text: 'Error: ' + r.data.message };
+          }).catch(e => {
+            console.error(e);
+            this.snackbar = { show: true, color: 'error', text: 'Error deleting logs' };
+          });
+        },
+        refreshPorts() {
+          this.portsLoading = true;
+          axios.get('/api/serial/ports').then(r => {
+            this.availablePorts = (r.data && Array.isArray(r.data.ports)) ? r.data.ports : [];
+            if (!this.selectedPort && this.availablePorts.length > 0)
+              this.selectedPort = this.availablePorts[0].path;
+            this.portsLoading = false;
+          }).catch(e => {
+            console.error(e);
+            this.snackbar = { show: true, color: 'error', text: 'Error fetching COM ports' };
+            this.portsLoading = false;
+            this.availablePorts = [];
+          });
+        },
+        onPortChange(port) {
+          if (!port) return;
+          this.portsLoading = true;
+          axios.post('/api/serial/select', { port }).then(r => {
+            if (r.data && r.data.success) {
+              this.snackbar = { show: true, color: 'success', text: `Port switched to ${port}` };
+              this.fetchSerialInfo();
+              this.fetchData();
+            } else {
+              this.snackbar = { show: true, color: 'error', text: (r.data && r.data.message) || 'Error switching port' };
+            }
+            this.portsLoading = false;
+          }).catch(e => {
+            console.error(e);
+            this.snackbar = { show: true, color: 'error', text: 'Error switching port' };
+            this.portsLoading = false;
+          });
+        },
+        resetZoom() {
+          if (this.chart) {
+            this.chart.resetZoom();
+            this.snackbar = { show: true, color: 'info', text: 'Zoom reset' };
+          }
+        },
+        togglePan() {
+          if (this.chart) {
+            this.panEnabled = !this.panEnabled;
+            this.chart.options.plugins.zoom.pan.enabled = this.panEnabled;
+            this.chart.update('none');
+            this.snackbar = { show: true, color: 'info',
+              text: this.panEnabled ? 'Panning enabled - click and drag' : 'Panning disabled' };
+          }
+        }
+      },
+      mounted() {
+        this.refreshPorts();
+        this.fetchSerialInfo();
+        this.fetchData();
+        this.startRefreshTimer();
+        window.addEventListener('resize', this.handleResize);
+        this.$nextTick(() => this.updateChart());
+      },
+      beforeDestroy() {
+        if (this.refreshTimer) clearInterval(this.refreshTimer);
+        window.removeEventListener('resize', this.handleResize);
+        if (this.chart) this.chart.destroy();
+      }
+    });
+
+    Chart.plugins.register(ChartZoom);
+  </script>
+</body>
+</html>

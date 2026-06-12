@@ -1,0 +1,125 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Sentec DO Widget</title>
+  <style>
+    @font-face { font-family: 'Roboto'; font-style: normal; font-weight: 400; src: url('vendor/Roboto-400.woff2') format('woff2'); }
+    @font-face { font-family: 'Roboto'; font-style: normal; font-weight: 500; src: url('vendor/Roboto-500.woff2') format('woff2'); }
+  </style>
+  <script src="vendor/vue.js"></script>
+  <script src="vendor/axios.min.js"></script>
+  <script src="vendor/chart.min.js"></script>
+  <style>
+    body { margin: 0; padding: 0; font-family: 'Roboto', sans-serif;
+           background-color: #1E1E1E; color: #FFFFFF; }
+    #app { width: 100%; height: 100vh; overflow: hidden; box-sizing: border-box; }
+    .chart-container { width: 100%; height: 100%; padding: 10px; position: relative; }
+    canvas { width: 100% !important; height: 100% !important; }
+  </style>
+</head>
+<body>
+  <div id="app">
+    <div class="chart-container">
+      <canvas id="widgetChart" ref="chartCanvas"></canvas>
+    </div>
+  </div>
+
+  <script>
+    new Vue({
+      el: '#app',
+      data: { chart: null, refreshTimer: null, measurements: [], doUnit: 'DO' },
+      methods: {
+        fetchData() {
+          axios.get('/api/data?duration=5&max_points=500').then(r => {
+            const newData = r.data || [];
+            if (newData.length > 0) {
+              this.measurements = newData;
+              const lastUnit = newData[newData.length - 1].do_unit;
+              if (lastUnit) this.doUnit = lastUnit;
+              this.updateChart();
+            }
+          }).catch(e => console.error('widget fetchData', e));
+        },
+        updateChart() {
+          if (!Array.isArray(this.measurements)) this.measurements = [];
+          const labels = this.measurements.map(m => {
+            try { return m && m.timestamp ? new Date(m.timestamp).toLocaleTimeString() : ''; }
+            catch (e) { return ''; }
+          });
+          const doData          = this.measurements.map(m => m && typeof m.do === 'number' ? m.do : null);
+          const temperatureData = this.measurements.map(m => m && typeof m.temperature === 'number' ? m.temperature : null);
+
+          if (!this.chart) {
+            const ctx = document.getElementById('widgetChart');
+            if (!ctx) return;
+            const c2d = ctx.getContext('2d');
+            if (!c2d) return;
+            this.chart = new Chart(c2d, {
+              type: 'line',
+              data: {
+                labels: labels,
+                datasets: [
+                  { label: `DO (${this.doUnit})`, data: doData, borderColor: '#2196F3',
+                    backgroundColor: 'rgba(33,150,243,0.1)', borderWidth: 2, pointRadius: 0,
+                    pointHoverRadius: 4, fill: true, yAxisID: 'y-do' },
+                  { label: 'Temp (\u00B0C)', data: temperatureData, borderColor: '#FF5252',
+                    backgroundColor: 'rgba(255,82,82,0.1)', borderWidth: 2, pointRadius: 0,
+                    pointHoverRadius: 4, fill: true, yAxisID: 'y-temp' }
+                ]
+              },
+              options: {
+                responsive: true, maintainAspectRatio: false, animation: false,
+                elements: { line: { tension: 0 } },
+                tooltips: { mode: 'index', intersect: false, backgroundColor: 'rgba(50,50,50,0.9)' },
+                hover: { mode: 'nearest', intersect: true },
+                legend: { position: 'bottom',
+                          labels: { fontFamily: 'Roboto', fontColor: '#FFFFFF',
+                                    boxWidth: 12, padding: 10 } },
+                scales: {
+                  xAxes: [{ display: true, gridLines: { color: 'rgba(255,255,255,0.1)' },
+                            ticks: { maxTicksLimit: 6, fontColor: '#FFFFFF' } }],
+                  yAxes: [
+                    { id: 'y-do', position: 'left', gridLines: { color: 'rgba(255,255,255,0.1)' },
+                      ticks: { maxTicksLimit: 5, fontColor: '#FFFFFF' } },
+                    { id: 'y-temp', position: 'right',
+                      gridLines: { drawOnChartArea: false, color: 'rgba(255,255,255,0.1)' },
+                      ticks: { maxTicksLimit: 5, fontColor: '#FFFFFF' } }
+                  ]
+                }
+              }
+            });
+          } else {
+            try {
+              this.chart.data.labels = labels;
+              this.chart.data.datasets[0].label = `DO (${this.doUnit})`;
+              this.chart.data.datasets[0].data = doData;
+              this.chart.data.datasets[1].data = temperatureData;
+              this.chart.update(0);
+            } catch (e) { console.error('widget update', e); }
+          }
+        },
+        handleResize() {
+          if (this.chart) {
+            try { this.chart.resize(); this.chart.update(0); }
+            catch (e) { console.error('widget resize', e); }
+          }
+        }
+      },
+      mounted() {
+        this.fetchData();
+        this.refreshTimer = setInterval(() => {
+          if (!document.hidden) this.fetchData();
+        }, 5000);
+        window.addEventListener('resize', this.handleResize);
+      },
+      beforeDestroy() {
+        if (this.refreshTimer) clearInterval(this.refreshTimer);
+        window.removeEventListener('resize', this.handleResize);
+        if (this.chart) this.chart.destroy();
+      }
+    });
+  </script>
+</body>
+</html>
