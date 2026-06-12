@@ -33,6 +33,23 @@ PARITY = serial.PARITY_NONE
 MODBUS_SLAVE_ID = 1
 POLL_INTERVAL_S = 5.0
 
+# ---------------------------------------------------------------------------
+# MAVLink2Rest / NAMED_VALUE_FLOAT addressing
+# ---------------------------------------------------------------------------
+# mavlink2rest keys its in-memory store by system_id/component_id/message_type,
+# so every NAMED_VALUE_FLOAT sent from the SAME (system, component) pair lands in
+# one slot and the last write wins (only one metric survives for the inspector
+# and the autopilot .BIN log). Each metric therefore needs its OWN component_id.
+# component_id 0 is MAV_COMP_ID_ALL and is an invalid *source* component, so we
+# also avoid it. Base 70 stays clear of the BlueOS PH/TEMP/SAL/COND extension
+# (25-28) and the Mikrotik-Monitor range (60-66).
+MAVLINK_SYSTEM_ID = 255
+MAVLINK_COMPONENT_ID_BASE = 70
+NAMED_VALUE_COMPONENTS = {
+    "DO": MAVLINK_COMPONENT_ID_BASE + 0,   # 70
+    "TDO": MAVLINK_COMPONENT_ID_BASE + 1,  # 71
+}
+
 SERIAL_PORT = DEFAULT_SERIAL_PORT
 SERIAL_CONFIG_FILE = "/app/logs/serial_config.json"
 
@@ -248,13 +265,24 @@ M2R_ENDPOINTS = [
 ]
 
 
-def send_to_mavlink(name, value):
-    """Send a NAMED_VALUE_FLOAT to any reachable MAVLink2Rest endpoint."""
+def send_to_mavlink(name, value, component_id=None):
+    """Send a NAMED_VALUE_FLOAT to any reachable MAVLink2Rest endpoint.
+
+    Each metric is published from its own component_id so it survives in the
+    mavlink2rest store (which keys by system/component/type) and is logged by
+    the autopilot. Falls back to the per-name map, then the base id.
+    """
+    if component_id is None:
+        component_id = NAMED_VALUE_COMPONENTS.get(name, MAVLINK_COMPONENT_ID_BASE)
     name_array = []
     for i in range(10):
         name_array.append(name[i] if i < len(name) else "\u0000")
     payload = {
-        "header": {"system_id": 255, "component_id": 0, "sequence": 0},
+        "header": {
+            "system_id": MAVLINK_SYSTEM_ID,
+            "component_id": component_id,
+            "sequence": 0,
+        },
         "message": {
             "type": "NAMED_VALUE_FLOAT",
             "time_boot_ms": 0,
@@ -266,7 +294,7 @@ def send_to_mavlink(name, value):
         try:
             response = requests.post(endpoint, json=payload, timeout=2.0)
             if response.status_code == 200:
-                print(f"Sent {name}={value} via {endpoint}")
+                print(f"Sent {name}={value} (comp {component_id}) via {endpoint}")
                 return True
         except Exception:
             continue
@@ -441,8 +469,8 @@ def read_sensor_loop():
                 print(f"Stored: {measurement}")
                 write_to_csv(measurement)
 
-                send_to_mavlink("DO", do_value)
-                send_to_mavlink("TDO", temperature)
+                send_to_mavlink("DO", do_value, NAMED_VALUE_COMPONENTS["DO"])
+                send_to_mavlink("TDO", temperature, NAMED_VALUE_COMPONENTS["TDO"])
 
             elapsed = time.time() - start
             time.sleep(max(0.0, POLL_INTERVAL_S - elapsed))
@@ -515,8 +543,11 @@ def get_serial():
         "baud_rate": BAUD_RATE,
         "framing": "8N2",
         "modbus_slave_id": MODBUS_SLAVE_ID,
+        "poll_interval_s": POLL_INTERVAL_S,
         "oxygen_unit": oxygen_unit_label,
         "oxygen_unit_code": oxygen_unit_code,
+        "mavlink_system_id": MAVLINK_SYSTEM_ID,
+        "mavlink_components": NAMED_VALUE_COMPONENTS,
     })
 
 
