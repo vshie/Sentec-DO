@@ -38,7 +38,7 @@ In BlueOS, open **Extensions -> Installed -> + (Add Extension)** and use:
 - **Extension Identifier**: `vshie.blueos-sentec-do`
 - **Extension Name**: `Sentec DO`
 - **Docker image**: `vshie/blueos-sentec-do`
-- **Docker tag**: `latest`
+- **Docker tag**: `main`
 - **Original Settings (Permissions)**: paste the JSON below
 
 ```json
@@ -71,6 +71,9 @@ In BlueOS, open **Extensions -> Installed -> + (Add Extension)** and use:
   }
 }
 ```
+
+The deploy action tags the image with the branch name, so commits on `main`
+publish `vshie/blueos-sentec-do:main`.
 
 After install, open the extension card and click *View* to access the
 dashboard. The live DO graph for embedding (e.g. in a BlueOS cockpit) is
