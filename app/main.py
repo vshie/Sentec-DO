@@ -68,6 +68,14 @@ UNIT_CODES = {
     0x40000000: "ppm gas",
 }
 
+# Unit we want the sensor to report by default. mg/L (ppm) is only valid while
+# the sensor is in "humid" measurement mode; if the sensor rejects it the value
+# reverts to its previous unit, so we cap how many times we try to set it (every
+# write touches the OXYnor's flash, which has a limited cycle count).
+DESIRED_OXYGEN_UNIT_CODE = 0x80  # ppm (mg/L)
+MAX_UNIT_WRITE_ATTEMPTS = 3
+_unit_write_attempts = 0
+
 # ---------------------------------------------------------------------------
 # Storage / logging
 # ---------------------------------------------------------------------------
@@ -83,9 +91,10 @@ MAX_CSV_SIZE_MB = 10
 data = []  # in-memory ring buffer (last 60)
 DATA_LOCK = Lock()
 
-# Cached oxygen unit so the API/UI can label axes without a round-trip every read
-oxygen_unit_code = 0x20
-oxygen_unit_label = UNIT_CODES[0x20]
+# Cached oxygen unit so the API/UI can label axes without a round-trip every read.
+# Defaults to the unit we ask the sensor to use; the real value is read back live.
+oxygen_unit_code = DESIRED_OXYGEN_UNIT_CODE
+oxygen_unit_label = UNIT_CODES[DESIRED_OXYGEN_UNIT_CODE]
 
 
 # ---------------------------------------------------------------------------
@@ -253,6 +262,48 @@ def _to_uint32(payload: bytes, idx: int) -> int:
     return struct.unpack(">I", high + low)[0]
 
 
+def _uint32_to_regs(value: int) -> bytes:
+    """Inverse of _to_uint32: pack a 32-bit value as two registers, low word
+    first, big-endian within each word (the OXYnor word order)."""
+    packed = struct.pack(">I", value & 0xFFFFFFFF)
+    return packed[2:4] + packed[0:2]
+
+
+def _write_uint32(ser, address, value):
+    """Write a 32-bit value to a 2-register holding block (Modbus function 16)."""
+    data = _uint32_to_regs(value)
+    pdu = bytes([
+        MODBUS_SLAVE_ID, 0x10,
+        (address >> 8) & 0xFF, address & 0xFF,
+        0x00, 0x02,  # quantity of registers
+        0x04,        # byte count
+    ]) + data
+    frame = pdu + crc16_modbus(pdu)
+    ser.reset_input_buffer()
+    ser.write(frame)
+    # Echo response: slave, func, addr(2), qty(2), CRC(2) = 8 bytes
+    expected = 8
+    deadline = time.time() + 1.0
+    buf = bytearray()
+    while len(buf) < expected and time.time() < deadline:
+        chunk = ser.read(expected - len(buf))
+        if not chunk:
+            time.sleep(0.02)
+            continue
+        buf.extend(chunk)
+    if len(buf) < expected or buf[0] != MODBUS_SLAVE_ID:
+        raise IOError(f"short or stray write response: {bytes(buf).hex()}")
+    if buf[1] & 0x80:
+        raise IOError(f"Modbus exception on write, code {buf[2] if len(buf) > 2 else '?'}")
+    if buf[1] != 0x10:
+        raise IOError(f"unexpected function code on write {buf[1]:#x}")
+    body = bytes(buf[:6])
+    crc_rx = bytes(buf[6:8])
+    if crc16_modbus(body) != crc_rx:
+        raise IOError("Modbus CRC mismatch on write response")
+    return True
+
+
 # ---------------------------------------------------------------------------
 # MAVLink2Rest integration (same approach as the PME extension)
 # ---------------------------------------------------------------------------
@@ -387,16 +438,51 @@ def write_to_csv(measurement):
 # ---------------------------------------------------------------------------
 # Sensor poll loop
 # ---------------------------------------------------------------------------
-def refresh_oxygen_unit(ser):
-    global oxygen_unit_code, oxygen_unit_label
+def _read_measurement_mode(ser):
+    """Best-effort read of the measurement-mode register (5703) for diagnostics."""
+    try:
+        payload = _read_holding(ser, 5703, 2)
+        return f"0x{_to_uint32(payload, 0):X}"
+    except Exception as e:
+        return f"unread ({e})"
+
+
+def ensure_oxygen_unit(ser):
+    """Read the oxygen-unit register (2089). If it isn't the desired unit
+    (mg/L by default) and we haven't exhausted our attempts, write the desired
+    code and read it back to confirm. The OXYnor stores this in flash, so we
+    only write when it differs and cap the number of attempts. mg/L is only
+    accepted in humid measurement mode; if rejected the unit reverts, in which
+    case we surface the measurement mode so the cause is obvious."""
+    global oxygen_unit_code, oxygen_unit_label, _unit_write_attempts
     try:
         payload = _read_holding(ser, 2089, 2)
         code = _to_uint32(payload, 0)
-        oxygen_unit_code = code
-        oxygen_unit_label = UNIT_CODES.get(code, f"unit 0x{code:X}")
-        print(f"Oxygen unit: {oxygen_unit_label} (0x{code:X})")
     except Exception as e:
         print(f"Could not read oxygen unit (reg 2089): {e}")
+        return
+
+    if code != DESIRED_OXYGEN_UNIT_CODE and _unit_write_attempts < MAX_UNIT_WRITE_ATTEMPTS:
+        _unit_write_attempts += 1
+        target = UNIT_CODES.get(DESIRED_OXYGEN_UNIT_CODE, f"0x{DESIRED_OXYGEN_UNIT_CODE:X}")
+        print(f"Oxygen unit is 0x{code:X}; setting to {target} "
+              f"(attempt {_unit_write_attempts}/{MAX_UNIT_WRITE_ATTEMPTS})")
+        try:
+            _write_uint32(ser, 2089, DESIRED_OXYGEN_UNIT_CODE)
+            time.sleep(0.2)  # OXYnor needs a brief settle slot after a write
+            payload = _read_holding(ser, 2089, 2)
+            code = _to_uint32(payload, 0)
+        except Exception as e:
+            print(f"Failed to set oxygen unit: {e}")
+        if code != DESIRED_OXYGEN_UNIT_CODE:
+            mode = _read_measurement_mode(ser)
+            print(f"Sensor did not accept {target}; it reports 0x{code:X}. "
+                  f"mg/L is only valid in humid measurement mode "
+                  f"(measurement-mode reg 5703 = {mode}).")
+
+    oxygen_unit_code = code
+    oxygen_unit_label = UNIT_CODES.get(code, f"unit 0x{code:X}")
+    print(f"Oxygen unit: {oxygen_unit_label} (0x{code:X})")
 
 
 def read_sensor_loop():
@@ -418,9 +504,10 @@ def read_sensor_loop():
 
             start = time.time()
 
-            # Refresh oxygen-unit code occasionally (1/min is plenty)
+            # Ensure/refresh oxygen-unit code occasionally (1/min is plenty).
+            # On startup this also sets the sensor to the desired unit (mg/L).
             if start - last_unit_refresh > 60:
-                refresh_oxygen_unit(serial_connection)
+                ensure_oxygen_unit(serial_connection)
                 last_unit_refresh = start
 
             # Read the 14-register measurement block at 4895

@@ -98,7 +98,14 @@ block `4895` (14 registers) every 5 seconds and decodes:
 
 Floats are 2 registers wide with the **low word first**, big-endian within each
 word. The oxygen unit code is read from register `2089` and reflected in the
-UI label (`% air saturation`, `mg/L`, etc.).
+UI label (`mg/L`, `% air saturation`, etc.).
+
+On startup the extension writes register `2089` to set the reported unit to
+**mg/L (ppm)** by default. This unit is only valid while the sensor is in
+*humid* measurement mode; if the sensor rejects it the value reverts to its
+previous unit and the log will note the current measurement mode (register
+`5703`). The write only happens when the unit differs (and is capped at a few
+attempts) to respect the sensor's limited flash-write cycles.
 
 ## MAVLink2Rest
 
