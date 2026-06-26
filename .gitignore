@@ -6,3 +6,19 @@
 logs/
 *.csv
 .DS_Store
+
+# Local DO log-analysis scratch (not part of the BlueOS extension)
+/.venv_doanalysis/
+/analyze.py
+/extract.py
+/refine.py
+/salcorr.py
+/do_sat.py
+/inspect_bin.py
+/inspect2.py
+/inspect3.py
+/bin_extract.npz
+/timeseries.png
+/scatter.png
+/profile.png
+/do_corrected.png

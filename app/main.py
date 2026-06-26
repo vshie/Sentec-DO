@@ -46,8 +46,9 @@ POLL_INTERVAL_S = 5.0
 MAVLINK_SYSTEM_ID = 255
 MAVLINK_COMPONENT_ID_BASE = 70
 NAMED_VALUE_COMPONENTS = {
-    "DO": MAVLINK_COMPONENT_ID_BASE + 0,   # 70
-    "TDO": MAVLINK_COMPONENT_ID_BASE + 1,  # 71
+    "DO": MAVLINK_COMPONENT_ID_BASE + 0,   # 70  primary unit (ppm / mg/L)
+    "TDO": MAVLINK_COMPONENT_ID_BASE + 1,  # 71  DO temperature
+    "DOS": MAVLINK_COMPONENT_ID_BASE + 2,  # 72  secondary unit (% air saturation)
 }
 
 SERIAL_PORT = DEFAULT_SERIAL_PORT
@@ -68,13 +69,41 @@ UNIT_CODES = {
     0x40000000: "ppm gas",
 }
 
-# Unit we want the sensor to report by default. mg/L (ppm) is only valid while
-# the sensor is in "humid" measurement mode; if the sensor rejects it the value
-# reverts to its previous unit, so we cap how many times we try to set it (every
-# write touches the OXYnor's flash, which has a limited cycle count).
-DESIRED_OXYGEN_UNIT_CODE = 0x80  # ppm (mg/L)
+# Units we want the sensor to report. The OXYnor can compute two units at once:
+# the primary unit lives in register 2089 (value in the 4895 block), and a
+# secondary unit lives in register 6063 (value in register 6065). We log both
+# so we always have:
+#   - ppm (mg/L): concentration, but salinity-dependent (sensor assumes the
+#     salinity in register 3115, default 0 = freshwater).
+#   - % air saturation: partial-pressure based and salinity-independent, so it
+#     can be re-converted to a correct mg/L in post-processing for any salinity.
+# mg/L (ppm) is only valid while the sensor is in "humid" measurement mode; if
+# the sensor rejects a unit it reverts, so we cap how many times we try to set
+# each one (every write touches the OXYnor's flash, which has a limited cycle
+# count).
+DESIRED_OXYGEN_UNIT_CODE = 0x80   # primary:   ppm (mg/L)
+DESIRED_SECOND_UNIT_CODE = 0x20   # secondary: % air saturation
 MAX_UNIT_WRITE_ATTEMPTS = 3
-_unit_write_attempts = 0
+# Per-slot write-attempt counters so a persistently rejected unit doesn't keep
+# burning flash write cycles.
+_unit_write_attempts = {"primary": 0, "secondary": 0}
+
+# ---------------------------------------------------------------------------
+# Salinity compensation (register 3115, float, PSU)
+# ---------------------------------------------------------------------------
+# The OXYnor applies salinity ONLY to concentration units (mg/L, ppm, ug/L,
+# umol/L); % air saturation is salinity-independent. The register is stored in
+# flash, so it is NEVER written automatically -- only on an explicit, confirmed
+# user request via /api/salinity, and only when the value actually differs --
+# to preserve the limited (~10k) flash write cycles. Whatever the user sets
+# simply persists on the sensor.
+SALINITY_REGISTER = 3115
+SALINITY_PRESETS = {"fresh": 0.0, "salt": 35.0}
+SALINITY_MIN = 0.0
+SALINITY_MAX = 45.0
+# A requested write within this tolerance (PSU) of the current value is a no-op,
+# so re-applying the same setting can't churn the flash.
+SALINITY_WRITE_EPSILON = 0.05
 
 # ---------------------------------------------------------------------------
 # Storage / logging
@@ -83,6 +112,7 @@ LOG_DIR = Path("/app/logs")
 LOG_FILE = LOG_DIR / "sensor_data.csv"
 CSV_HEADERS = [
     "timestamp", "temperature", "do", "do_unit",
+    "do_air_saturation", "do_air_saturation_unit",
     "pressure", "phase", "error",
     "vehicle_temperature", "latitude", "longitude",
 ]
@@ -91,10 +121,13 @@ MAX_CSV_SIZE_MB = 10
 data = []  # in-memory ring buffer (last 60)
 DATA_LOCK = Lock()
 
-# Cached oxygen unit so the API/UI can label axes without a round-trip every read.
-# Defaults to the unit we ask the sensor to use; the real value is read back live.
+# Cached oxygen units so the API/UI can label axes without a round-trip every
+# read. Defaults to the units we ask the sensor to use; the real values are read
+# back live.
 oxygen_unit_code = DESIRED_OXYGEN_UNIT_CODE
 oxygen_unit_label = UNIT_CODES[DESIRED_OXYGEN_UNIT_CODE]
+second_unit_code = DESIRED_SECOND_UNIT_CODE
+second_unit_label = UNIT_CODES[DESIRED_SECOND_UNIT_CODE]
 
 
 # ---------------------------------------------------------------------------
@@ -269,15 +302,22 @@ def _uint32_to_regs(value: int) -> bytes:
     return packed[2:4] + packed[0:2]
 
 
-def _write_uint32(ser, address, value):
-    """Write a 32-bit value to a 2-register holding block (Modbus function 16)."""
-    data = _uint32_to_regs(value)
+def _float_to_regs(value: float) -> bytes:
+    """Inverse of _to_float: pack a float as two registers, low word first,
+    big-endian within each word (the OXYnor word order)."""
+    packed = struct.pack(">f", float(value))
+    return packed[2:4] + packed[0:2]
+
+
+def _write_2reg(ser, address, data4: bytes):
+    """Write a 4-byte (2-register) block via Modbus function 16. ``data4`` must
+    already be in OXYnor word order (low word first, big-endian within word)."""
     pdu = bytes([
         MODBUS_SLAVE_ID, 0x10,
         (address >> 8) & 0xFF, address & 0xFF,
         0x00, 0x02,  # quantity of registers
         0x04,        # byte count
-    ]) + data
+    ]) + data4
     frame = pdu + crc16_modbus(pdu)
     ser.reset_input_buffer()
     ser.write(frame)
@@ -302,6 +342,16 @@ def _write_uint32(ser, address, value):
     if crc16_modbus(body) != crc_rx:
         raise IOError("Modbus CRC mismatch on write response")
     return True
+
+
+def _write_uint32(ser, address, value):
+    """Write a 32-bit value to a 2-register holding block (Modbus function 16)."""
+    return _write_2reg(ser, address, _uint32_to_regs(value))
+
+
+def _write_float(ser, address, value):
+    """Write an IEEE-754 float to a 2-register holding block (Modbus fn 16)."""
+    return _write_2reg(ser, address, _float_to_regs(value))
 
 
 # ---------------------------------------------------------------------------
@@ -447,42 +497,81 @@ def _read_measurement_mode(ser):
         return f"unread ({e})"
 
 
-def ensure_oxygen_unit(ser):
-    """Read the oxygen-unit register (2089). If it isn't the desired unit
-    (mg/L by default) and we haven't exhausted our attempts, write the desired
-    code and read it back to confirm. The OXYnor stores this in flash, so we
-    only write when it differs and cap the number of attempts. mg/L is only
-    accepted in humid measurement mode; if rejected the unit reverts, in which
-    case we surface the measurement mode so the cause is obvious."""
-    global oxygen_unit_code, oxygen_unit_label, _unit_write_attempts
+def _ensure_unit(ser, register, desired_code, slot):
+    """Ensure an oxygen-unit register holds ``desired_code``.
+
+    Reads the unit register; if it isn't the desired code and we haven't
+    exhausted our per-slot attempts, writes the desired code and reads it back
+    to confirm. The OXYnor stores these units in flash, so we only write when
+    the value differs and cap the number of attempts. mg/L is only accepted in
+    humid measurement mode; if rejected the unit reverts, in which case we
+    surface the measurement mode so the cause is obvious.
+
+    Returns ``(code, label)`` or ``(None, None)`` if the register couldn't be
+    read.
+    """
     try:
-        payload = _read_holding(ser, 2089, 2)
+        payload = _read_holding(ser, register, 2)
         code = _to_uint32(payload, 0)
     except Exception as e:
-        print(f"Could not read oxygen unit (reg 2089): {e}")
-        return
+        print(f"Could not read oxygen unit (reg {register}): {e}")
+        return None, None
 
-    if code != DESIRED_OXYGEN_UNIT_CODE and _unit_write_attempts < MAX_UNIT_WRITE_ATTEMPTS:
-        _unit_write_attempts += 1
-        target = UNIT_CODES.get(DESIRED_OXYGEN_UNIT_CODE, f"0x{DESIRED_OXYGEN_UNIT_CODE:X}")
-        print(f"Oxygen unit is 0x{code:X}; setting to {target} "
-              f"(attempt {_unit_write_attempts}/{MAX_UNIT_WRITE_ATTEMPTS})")
+    if code != desired_code and _unit_write_attempts[slot] < MAX_UNIT_WRITE_ATTEMPTS:
+        _unit_write_attempts[slot] += 1
+        target = UNIT_CODES.get(desired_code, f"0x{desired_code:X}")
+        print(f"{slot.capitalize()} oxygen unit (reg {register}) is 0x{code:X}; "
+              f"setting to {target} "
+              f"(attempt {_unit_write_attempts[slot]}/{MAX_UNIT_WRITE_ATTEMPTS})")
         try:
-            _write_uint32(ser, 2089, DESIRED_OXYGEN_UNIT_CODE)
+            _write_uint32(ser, register, desired_code)
             time.sleep(0.2)  # OXYnor needs a brief settle slot after a write
-            payload = _read_holding(ser, 2089, 2)
+            payload = _read_holding(ser, register, 2)
             code = _to_uint32(payload, 0)
         except Exception as e:
-            print(f"Failed to set oxygen unit: {e}")
-        if code != DESIRED_OXYGEN_UNIT_CODE:
+            print(f"Failed to set {slot} oxygen unit: {e}")
+        if code != desired_code:
             mode = _read_measurement_mode(ser)
-            print(f"Sensor did not accept {target}; it reports 0x{code:X}. "
-                  f"mg/L is only valid in humid measurement mode "
-                  f"(measurement-mode reg 5703 = {mode}).")
+            print(f"Sensor did not accept {target} for the {slot} unit; it "
+                  f"reports 0x{code:X}. mg/L is only valid in humid measurement "
+                  f"mode (measurement-mode reg 5703 = {mode}).")
 
-    oxygen_unit_code = code
-    oxygen_unit_label = UNIT_CODES.get(code, f"unit 0x{code:X}")
-    print(f"Oxygen unit: {oxygen_unit_label} (0x{code:X})")
+    return code, UNIT_CODES.get(code, f"unit 0x{code:X}")
+
+
+def ensure_oxygen_units(ser):
+    """Ensure both the primary (reg 2089, ppm/mg/L) and secondary (reg 6063,
+    % air saturation) oxygen units are configured, caching their codes/labels
+    for the API/UI and the CSV writer."""
+    global oxygen_unit_code, oxygen_unit_label, second_unit_code, second_unit_label
+
+    code, label = _ensure_unit(ser, 2089, DESIRED_OXYGEN_UNIT_CODE, "primary")
+    if code is not None:
+        oxygen_unit_code, oxygen_unit_label = code, label
+
+    code2, label2 = _ensure_unit(ser, 6063, DESIRED_SECOND_UNIT_CODE, "secondary")
+    if code2 is not None:
+        second_unit_code, second_unit_label = code2, label2
+
+    print(f"Oxygen units: primary={oxygen_unit_label} (0x{oxygen_unit_code:X}), "
+          f"secondary={second_unit_label} (0x{second_unit_code:X})")
+
+
+def read_salinity(ser):
+    """Read the salinity-compensation value (register 3115, float PSU)."""
+    payload = _read_holding(ser, SALINITY_REGISTER, 2)
+    return _to_float(payload, 0)
+
+
+def classify_salinity(value):
+    """Map a salinity value to a UI mode label."""
+    if value is None:
+        return "unknown"
+    if abs(value - SALINITY_PRESETS["fresh"]) < SALINITY_WRITE_EPSILON:
+        return "fresh"
+    if abs(value - SALINITY_PRESETS["salt"]) < SALINITY_WRITE_EPSILON:
+        return "salt"
+    return "custom"
 
 
 def read_sensor_loop():
@@ -504,10 +593,11 @@ def read_sensor_loop():
 
             start = time.time()
 
-            # Ensure/refresh oxygen-unit code occasionally (1/min is plenty).
-            # On startup this also sets the sensor to the desired unit (mg/L).
+            # Ensure/refresh oxygen-unit codes occasionally (1/min is plenty).
+            # On startup this also sets the sensor to the desired units
+            # (primary mg/L + secondary % air saturation).
             if start - last_unit_refresh > 60:
-                ensure_oxygen_unit(serial_connection)
+                ensure_oxygen_units(serial_connection)
                 last_unit_refresh = start
 
             # Read the 14-register measurement block at 4895
@@ -530,6 +620,16 @@ def read_sensor_loop():
                 print(f"Decode failed: {e} raw={blk.hex()}")
                 continue
 
+            # Secondary oxygen value (% air saturation) lives in register 6065,
+            # outside the 4895 block, so it needs its own read. Failure here must
+            # not drop the primary measurement.
+            do_air_sat = None
+            try:
+                blk2 = _read_holding(serial_connection, 6065, 2)
+                do_air_sat = _to_float(blk2, 0)
+            except Exception as e:
+                print(f"Secondary oxygen (reg 6065) read failed: {e}")
+
             gps = get_gps_position()
             v_temp = get_vehicle_temperature()
 
@@ -538,6 +638,8 @@ def read_sensor_loop():
                 "temperature": round(temperature, 3),
                 "do": round(do_value, 3),
                 "do_unit": oxygen_unit_label,
+                "do_air_saturation": round(do_air_sat, 3) if do_air_sat is not None else None,
+                "do_air_saturation_unit": second_unit_label,
                 "pressure": round(pressure, 2),
                 "phase": round(phase, 3),
                 "error": error,
@@ -558,6 +660,8 @@ def read_sensor_loop():
 
                 send_to_mavlink("DO", do_value, NAMED_VALUE_COMPONENTS["DO"])
                 send_to_mavlink("TDO", temperature, NAMED_VALUE_COMPONENTS["TDO"])
+                if do_air_sat is not None:
+                    send_to_mavlink("DOS", do_air_sat, NAMED_VALUE_COMPONENTS["DOS"])
 
             elapsed = time.time() - start
             time.sleep(max(0.0, POLL_INTERVAL_S - elapsed))
@@ -603,6 +707,8 @@ def get_data():
                         "temperature": float(row["temperature"]) if row.get("temperature") else None,
                         "do": float(row["do"]) if row.get("do") else None,
                         "do_unit": row.get("do_unit") or oxygen_unit_label,
+                        "do_air_saturation": float(row["do_air_saturation"]) if row.get("do_air_saturation") else None,
+                        "do_air_saturation_unit": row.get("do_air_saturation_unit") or second_unit_label,
                         "pressure": float(row["pressure"]) if row.get("pressure") else None,
                         "phase": float(row["phase"]) if row.get("phase") else None,
                         "error": int(row["error"]) if row.get("error") not in (None, "") else None,
@@ -633,6 +739,8 @@ def get_serial():
         "poll_interval_s": POLL_INTERVAL_S,
         "oxygen_unit": oxygen_unit_label,
         "oxygen_unit_code": oxygen_unit_code,
+        "secondary_oxygen_unit": second_unit_label,
+        "secondary_oxygen_unit_code": second_unit_code,
         "mavlink_system_id": MAVLINK_SYSTEM_ID,
         "mavlink_components": NAMED_VALUE_COMPONENTS,
     })
@@ -661,6 +769,92 @@ def select_serial_port():
         SERIAL_PORT = old_port
         initialize_serial_connection()
         return jsonify({"success": False, "message": f"Failed to connect to {new_port}, reverted to {old_port}"}), 500
+
+
+@app.route("/api/salinity")
+def get_salinity():
+    """Read the salinity the sensor is currently using for mg/L compensation."""
+    with SERIAL_LOCK:
+        if not serial_connection or not serial_connection.is_open:
+            if not initialize_serial_connection():
+                return jsonify({"success": False, "message": "Serial port unavailable"}), 503
+        try:
+            value = read_salinity(serial_connection)
+        except Exception as e:
+            return jsonify({"success": False, "message": f"Could not read salinity: {e}"}), 500
+    return jsonify({
+        "success": True,
+        "salinity": round(value, 3),
+        "mode": classify_salinity(value),
+        "presets": SALINITY_PRESETS,
+        "min": SALINITY_MIN,
+        "max": SALINITY_MAX,
+        "unit": "PSU",
+    })
+
+
+@app.route("/api/salinity", methods=["POST"])
+def set_salinity():
+    """Write the salinity-compensation value to the sensor.
+
+    Requires an explicit ``confirm: true`` in the body (the UI surfaces a
+    confirmation prompt) because this persists to the OXYnor's limited-cycle
+    flash. Never called automatically. If the requested value matches what the
+    sensor already holds, no write is performed.
+    """
+    body = request.json or {}
+    if not body.get("confirm"):
+        return jsonify({
+            "success": False,
+            "message": "Confirmation required before writing salinity to sensor flash",
+        }), 400
+    try:
+        value = float(body.get("value"))
+    except (TypeError, ValueError):
+        return jsonify({"success": False, "message": "Invalid salinity value"}), 400
+    if not (SALINITY_MIN <= value <= SALINITY_MAX):
+        return jsonify({
+            "success": False,
+            "message": f"Salinity must be between {SALINITY_MIN} and {SALINITY_MAX} PSU",
+        }), 400
+
+    with SERIAL_LOCK:
+        if not serial_connection or not serial_connection.is_open:
+            if not initialize_serial_connection():
+                return jsonify({"success": False, "message": "Serial port unavailable"}), 503
+        try:
+            current = read_salinity(serial_connection)
+        except Exception as e:
+            return jsonify({"success": False, "message": f"Could not read current salinity: {e}"}), 500
+
+        if abs(current - value) < SALINITY_WRITE_EPSILON:
+            return jsonify({
+                "success": True,
+                "written": False,
+                "salinity": round(current, 3),
+                "mode": classify_salinity(current),
+                "message": f"Salinity already {current:.2f} PSU; no write performed.",
+            })
+
+        try:
+            _write_float(serial_connection, SALINITY_REGISTER, value)
+            time.sleep(0.2)  # OXYnor settle slot after a flash write
+            new_value = read_salinity(serial_connection)
+        except Exception as e:
+            return jsonify({"success": False, "message": f"Failed to write salinity: {e}"}), 500
+
+    ok = abs(new_value - value) < SALINITY_WRITE_EPSILON
+    print(f"Salinity write requested={value:.2f} PSU, sensor now {new_value:.2f} PSU "
+          f"({'ok' if ok else 'MISMATCH'})")
+    return jsonify({
+        "success": ok,
+        "written": True,
+        "salinity": round(new_value, 3),
+        "mode": classify_salinity(new_value),
+        "message": (f"Salinity set to {new_value:.2f} PSU"
+                    if ok else
+                    f"Wrote {value:.2f} PSU but sensor reports {new_value:.2f} PSU"),
+    })
 
 
 @app.route("/register_service")

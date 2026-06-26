@@ -176,14 +176,59 @@
 
                     <v-col cols="12" md="6">
                       <v-card elevation="2">
+                        <v-card-title>Salinity Compensation</v-card-title>
+                        <v-card-text>
+                          <v-select
+                            v-model="salinityMode"
+                            :items="salinityModeOptions"
+                            label="Water type"
+                            outlined dense hide-details
+                          ></v-select>
+                          <v-text-field
+                            v-if="salinityMode === 'custom'"
+                            v-model.number="salinityCustom"
+                            label="Custom salinity (PSU)"
+                            type="number"
+                            outlined dense
+                            class="mt-3"
+                            :min="salinity.min" :max="salinity.max" step="0.1"
+                            hint="Practical Salinity Units (0 = fresh, ~35 = seawater)"
+                            persistent-hint
+                          ></v-text-field>
+                          <div class="mt-3 caption">
+                            <v-icon small color="info">mdi-information</v-icon>
+                            Current sensor salinity:
+                            <strong>{{ salinity.value != null ? salinity.value.toFixed(2) + ' PSU' : '--' }}</strong>
+                            ({{ salinity.mode }}). Applied to mg/L (ppm) only; % air saturation is unaffected.
+                          </div>
+                          <div class="mt-1 caption warning--text">
+                            <v-icon small color="warning">mdi-alert</v-icon>
+                            Writing stores to sensor flash (limited write cycles) and is never automatic &mdash;
+                            you will be asked to confirm.
+                          </div>
+                          <v-btn color="primary" block class="mt-3"
+                                 :loading="salinityLoading"
+                                 :disabled="salinityLoading || !salinityChanged"
+                                 @click="promptSalinity">
+                            <v-icon left>mdi-content-save</v-icon>Apply Salinity
+                          </v-btn>
+                        </v-card-text>
+                      </v-card>
+                    </v-col>
+
+                    <v-col cols="12" md="6">
+                      <v-card elevation="2">
                         <v-card-title>About</v-card-title>
                         <v-card-text>
                           <p>Sentec DO is a BlueOS extension that reads a Sentec OXYnor
                           dissolved-oxygen sensor over RS485 / Modbus RTU (via a BLUART
-                          adapter) and forwards readings to the autopilot's
-                          <code>.BIN</code> log as <code>DO</code> and <code>TDO</code>
-                          named-value floats.</p>
-                          <p class="mb-0"><strong>Version:</strong> 0.1.0</p>
+                          adapter). It logs DO in both <code>ppm (mg/L)</code> and
+                          <code>% air saturation</code>, and forwards readings to the
+                          autopilot's <code>.BIN</code> log as <code>DO</code> (mg/L),
+                          <code>TDO</code> (temperature) and <code>DOS</code> (% air sat.)
+                          named-value floats. Salinity compensation for mg/L is user-set
+                          and persists on the sensor.</p>
+                          <p class="mb-0"><strong>Version:</strong> 0.2.0</p>
                         </v-card-text>
                       </v-card>
                     </v-col>
@@ -203,6 +248,24 @@
             <v-spacer></v-spacer>
             <v-btn color="primary" text @click="showDeleteDialog = false">Cancel</v-btn>
             <v-btn color="error" text @click="deleteLogsConfirmed">Delete</v-btn>
+          </v-card-actions>
+        </v-card>
+      </v-dialog>
+
+      <v-dialog v-model="showSalinityDialog" max-width="460">
+        <v-card>
+          <v-card-title class="headline">Write salinity to sensor?</v-card-title>
+          <v-card-text>
+            This writes
+            <strong>{{ pendingSalinity != null ? pendingSalinity.toFixed(2) : '--' }} PSU</strong>
+            to the OXYnor's flash so dissolved oxygen in mg/L (ppm) is reported accurately for this
+            water type. The sensor flash has a limited number of write cycles, so only change this
+            when needed. The value persists on the sensor until you change it again.
+          </v-card-text>
+          <v-card-actions>
+            <v-spacer></v-spacer>
+            <v-btn color="primary" text @click="showSalinityDialog = false">Cancel</v-btn>
+            <v-btn color="warning" text @click="applySalinityConfirmed">Write</v-btn>
           </v-card-actions>
         </v-card>
       </v-dialog>
@@ -250,9 +313,33 @@
         selectedPort: '',
         availablePorts: [],
         portsLoading: false,
-        panEnabled: false
+        panEnabled: false,
+        salinity: { value: null, mode: 'unknown', min: 0, max: 45, presets: { fresh: 0, salt: 35 } },
+        salinityMode: 'fresh',
+        salinityCustom: 0,
+        salinityLoading: false,
+        showSalinityDialog: false,
+        pendingSalinity: null,
+        salinityModeOptions: [
+          { text: 'Fresh water (0 PSU)', value: 'fresh' },
+          { text: 'Saltwater (35 PSU)',  value: 'salt' },
+          { text: 'Custom\u2026',          value: 'custom' }
+        ]
       },
       computed: {
+        targetSalinity() {
+          if (this.salinityMode === 'fresh') return this.salinity.presets.fresh;
+          if (this.salinityMode === 'salt')  return this.salinity.presets.salt;
+          const v = Number(this.salinityCustom);
+          return isNaN(v) ? null : v;
+        },
+        salinityChanged() {
+          const t = this.targetSalinity;
+          if (t == null) return false;
+          if (t < this.salinity.min || t > this.salinity.max) return false;
+          if (this.salinity.value == null) return true;
+          return Math.abs(t - this.salinity.value) >= 0.05;
+        },
         latest() {
           return this.measurements.length ? this.measurements[this.measurements.length - 1] : null;
         },
@@ -441,11 +528,60 @@
             this.snackbar = { show: true, color: 'info',
               text: this.panEnabled ? 'Panning enabled - click and drag' : 'Panning disabled' };
           }
+        },
+        fetchSalinity() {
+          axios.get('/api/salinity').then(r => {
+            if (r.data && r.data.success) {
+              this.salinity = {
+                value: r.data.salinity, mode: r.data.mode,
+                min: r.data.min, max: r.data.max, presets: r.data.presets
+              };
+              this.salinityMode = (r.data.mode === 'unknown') ? 'fresh' : r.data.mode;
+              if (r.data.mode === 'custom') this.salinityCustom = r.data.salinity;
+            }
+          }).catch(e => console.error('fetchSalinity', e));
+        },
+        promptSalinity() {
+          const t = this.targetSalinity;
+          if (t == null) {
+            this.snackbar = { show: true, color: 'error', text: 'Enter a valid salinity value' };
+            return;
+          }
+          if (t < this.salinity.min || t > this.salinity.max) {
+            this.snackbar = { show: true, color: 'error',
+              text: `Salinity must be ${this.salinity.min}-${this.salinity.max} PSU` };
+            return;
+          }
+          this.pendingSalinity = t;
+          this.showSalinityDialog = true;
+        },
+        applySalinityConfirmed() {
+          this.showSalinityDialog = false;
+          const value = this.pendingSalinity;
+          if (value == null) return;
+          this.salinityLoading = true;
+          axios.post('/api/salinity', { value: value, confirm: true }).then(r => {
+            if (r.data && r.data.success) {
+              this.salinity.value = r.data.salinity;
+              this.salinity.mode = r.data.mode;
+              this.snackbar = { show: true, color: 'success', text: r.data.message || 'Salinity updated' };
+            } else {
+              this.snackbar = { show: true, color: 'error',
+                text: (r.data && r.data.message) || 'Error writing salinity' };
+            }
+            this.salinityLoading = false;
+          }).catch(e => {
+            console.error(e);
+            const msg = (e.response && e.response.data && e.response.data.message) || 'Error writing salinity';
+            this.snackbar = { show: true, color: 'error', text: msg };
+            this.salinityLoading = false;
+          });
         }
       },
       mounted() {
         this.refreshPorts();
         this.fetchSerialInfo();
+        this.fetchSalinity();
         this.fetchData();
         this.startRefreshTimer();
         window.addEventListener('resize', this.handleResize);
